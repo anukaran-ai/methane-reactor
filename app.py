@@ -19,9 +19,14 @@ st.set_page_config(
 )
 
 # ============================================================================
-# API CONFIGURATION
+# API CONFIGURATION (SECURE)
 # ============================================================================
-GEMINI_API_KEY = "AIzaSyDTJGfbX8BrxLrNpk6OYQbAVb7_eiIB5Us" 
+# This fetches the key securely from Streamlit Secrets (cloud) or secrets.toml (local)
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+except (FileNotFoundError, KeyError):
+    st.error("⚠️ API Key missing! Please configure 'GEMINI_API_KEY' in Streamlit Secrets.")
+    st.stop()
 
 # ============================================================================
 # PHYSICAL CONSTANTS & HELPER FUNCTIONS
@@ -65,19 +70,20 @@ def ergun_pressure_drop(u, rho, mu, d_p, eps):
     return term1 + term2
 
 # ============================================================================
-# AI ASSISTANT LOGIC
+# AI ASSISTANT LOGIC (Robust Auto-Detect)
 # ============================================================================
 class GeminiAssistant:
     def __init__(self, api_key):
         self.model = None
         self.model_available = False
         
-        if not api_key or "PASTE_YOUR" in api_key:
+        if not api_key:
             st.error("⚠️ AI ERROR: Invalid API Key.")
             return
 
         try:
             genai.configure(api_key=api_key)
+            # Auto-detect best available model
             all_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
             available_names = [m.replace("models/", "") for m in all_models]
             
@@ -88,7 +94,7 @@ class GeminiAssistant:
                 self.model = genai.GenerativeModel(target_model)
                 self.model_available = True
             else:
-                st.error("❌ No AI models found.")
+                st.error("❌ No text generation models found for this API key.")
                 self.model_available = False
             
         except Exception as e:
@@ -97,6 +103,7 @@ class GeminiAssistant:
 
     def generate_response(self, user_message, context_str):
         if not self.model_available: return "AI is not available."
+        
         prompt = (
             "You are an expert chemical reaction engineering assistant.\n"
             f"Simulation context: {context_str}\n\n"
@@ -105,7 +112,7 @@ class GeminiAssistant:
         try:
             return self.model.generate_content(prompt).text
         except Exception as e:
-            if "429" in str(e): return "⚠️ Quota Limit Exceeded. Please wait 30s."
+            if "429" in str(e): return "⚠️ Quota Limit Exceeded. Please wait 30 seconds."
             return f"Error: {e}"
 
 # ============================================================================
@@ -127,6 +134,7 @@ class MethaneDecompositionReactor:
     def __init__(self, config: ReactorConfig, isothermal: bool = True):
         self.cfg = config
         self.isothermal = isothermal
+        
         C_total_in = config.inlet_pressure / (R_GAS * config.inlet_temperature) / 1000
         self.F_total_in = config.flow_rate * C_total_in
         self.F_CH4_in = config.y_CH4_in * self.F_total_in
@@ -137,7 +145,7 @@ class MethaneDecompositionReactor:
         F_CH4, F_H2, T, P = y
         cfg = self.cfg
         
-        # Clamps to prevent negative/zero crashes
+        # Stability Clamps
         F_CH4 = max(F_CH4, 1e-30); F_H2 = max(F_H2, 0.0); T = max(T, 300.0); P = max(P, 1000.0)
         
         F_total = F_CH4 + F_H2 + self.F_N2_in
@@ -145,6 +153,7 @@ class MethaneDecompositionReactor:
         
         rho = gas_density(T, P, y_CH4, y_H2, y_N2)
         mu = gas_viscosity(T, y_CH4, y_H2, y_N2)
+        
         Q = F_total * 1000 * R_GAS * T / P
         u = Q / cfg.cross_section_area
         
@@ -261,7 +270,7 @@ def handle_ai_request(prompt_text):
     st.session_state.chat_history.append({"role": "assistant", "content": response})
 
 # --- HEADER ---
-st.image("https://raw.githubusercontent.com/anukaranAI/methane-reactor/main/AnukaranNew7.png", width=500)
+st.image("https://raw.githubusercontent.com/anukaranAI/methane-reactor/main/AnukaranLogo.png", width=500)
 st.markdown("### Methane Decomposition Reactor Simulator | Full Physics Engine")
 st.markdown("---")
 
@@ -317,7 +326,7 @@ with col_results:
         m1, m2, m3 = st.columns(3)
         m1.metric("Conversion", f"{r['X_CH4'][-1]*100:.2f} %")
         m2.metric("H2 Generation", f"{r['V_dot_H2_Nm3_h'][-1]:.4f} Nm³/h")
-        m3.metric("Outlet Temp", f"{r['T'][-1]-273.15:.1f} °C")
+        m3.metric("H2 Mass", f"{r['m_dot_H2_kg_s'][-1]*3600:.4f} kg/h")
         
         # Tabs
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Conversion", "Flow", "Composition", "Temp", "Pressure", "Yield"])
