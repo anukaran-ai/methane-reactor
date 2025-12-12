@@ -232,8 +232,8 @@ def handle_ai_request(prompt_text):
     response = ai.generate_response(prompt_text, context_str)
     st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-# --- Header ---
-st.title("🔬 ANUKARAN AI")
+# --- Header (LOGO ADDED HERE) ---
+st.image("https://raw.githubusercontent.com/anukaranAI/methane-reactor/main/AnukaranLogo.png", width=500)
 st.markdown("### Methane Decomposition Reactor Simulator | Full Physics Engine")
 st.markdown("---")
 
