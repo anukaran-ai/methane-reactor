@@ -1,22 +1,15 @@
 import streamlit as st
 import numpy as np
-from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 import pandas as pd
-from dataclasses import dataclass
+from skopt import gp_minimize
+from skopt.space import Real
+from skopt.utils import use_named_args
 import time
-import google.generativeai as genai
-import os
 
-# ============================================================================
-# PAGE CONFIGURATION
-# ============================================================================
-st.set_page_config(
-    page_title="Anukaran AI - Reactor Sim",
-    page_icon="🔬",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- IMPORT MODULES ---
+from reactor_model import ReactorConfig, MethaneDecompositionReactor, MW_C, MW_H2
+from ai_assistant import GeminiAssistant
 
 # ============================================================================
 # API CONFIGURATION (SECURE)
