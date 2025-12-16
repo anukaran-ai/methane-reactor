@@ -1,243 +1,99 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║                         ANUKARAN AI                              ║
+║          Methane Decomposition Reactor Simulator                 ║
+║                  with AI-Powered Optimization                    ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
 import streamlit as st
 import numpy as np
-from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 import pandas as pd
-from dataclasses import dataclass  # <--- THIS LINE IS MISSING!
 import time
-import google.generativeai as genai
-import os
 
-# --- IMPORT MODULES ---
+# --- LOCAL IMPORTS ---
 from reactor_model import ReactorConfig, MethaneDecompositionReactor, MW_C, MW_H2
 from ai_assistant import GeminiAssistant
+from core.templates import OPTIMIZATION_TEMPLATES, get_template, get_template_names
+from core.optimizer import (
+    OptimizationConfig, 
+    BayesianOptimizer, 
+    SensitivityAnalyzer,
+    create_objective_function,
+    get_base_config_from_session
+)
+from utils.plotting import (
+    create_convergence_plot,
+    create_parameter_importance_plot,
+    create_trials_table_data,
+    create_summary_stats
+)
 
 # ============================================================================
-# API CONFIGURATION (SECURE)
+# PAGE CONFIG
 # ============================================================================
-# This fetches the key securely from Streamlit Secrets (cloud) or secrets.toml (local)
+st.set_page_config(
+    page_title="Anukaran AI - Reactor Simulator",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ============================================================================
+# API KEY
+# ============================================================================
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
 except (FileNotFoundError, KeyError):
-    st.error("⚠️ API Key missing! Please configure 'GEMINI_API_KEY' in Streamlit Secrets.")
-    st.stop()
+    GEMINI_API_KEY = ""
 
 # ============================================================================
-# PHYSICAL CONSTANTS & HELPER FUNCTIONS
+# SESSION STATE INITIALIZATION
 # ============================================================================
-R_GAS = 8.314
-MW_CH4 = 16.04e-3
-MW_H2 = 2.016e-3
-MW_C = 12.01e-3
-MW_N2 = 28.01e-3
-
-def gas_viscosity(T, y_CH4, y_H2, y_N2):
-    mu_CH4 = 1.02e-5 * (T / 300) ** 0.87
-    mu_H2 = 8.76e-6 * (T / 300) ** 0.68
-    mu_N2 = 1.78e-5 * (T / 300) ** 0.67
-    return y_CH4 * mu_CH4 + y_H2 * mu_H2 + y_N2 * mu_N2
-
-def gas_density(T, P, y_CH4, y_H2, y_N2):
-    MW_mix = y_CH4 * MW_CH4 + y_H2 * MW_H2 + y_N2 * MW_N2
-    return P * MW_mix / (R_GAS * T)
-
-def diffusivity_CH4(T, P):
-    return 1.87e-5 * (T / 300) ** 1.75 * (101325 / P)
-
-def heat_capacity_mix(T, y_CH4, y_H2, y_N2):
-    Cp_CH4 = 35.69 + 0.0275 * T
-    Cp_H2 = 28.84 + 0.00192 * T
-    Cp_N2 = 29.12 + 0.00293 * T
-    return y_CH4 * Cp_CH4 + y_H2 * Cp_H2 + y_N2 * Cp_N2
-
-def arrhenius_rate_constant(T, A, Ea, beta):
-    return A * T ** beta * np.exp(-Ea / (R_GAS * T))
-
-def effectiveness_factor(phi):
-    if phi < 0.1: return 1.0
-    elif phi > 100: return 3.0 / phi
-    else: return (3.0 / phi) * (1.0 / np.tanh(phi) - 1.0 / phi)
-
-def ergun_pressure_drop(u, rho, mu, d_p, eps):
-    term1 = 150 * mu * (1 - eps)**2 / (d_p**2 * eps**3) * u
-    term2 = 1.75 * rho * (1 - eps) / (d_p * eps**3) * u**2
-    return term1 + term2
+if 'simulation_data' not in st.session_state:
+    st.session_state.simulation_data = None
+if 'config_data' not in st.session_state:
+    st.session_state.config_data = None
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'optimization_result' not in st.session_state:
+    st.session_state.optimization_result = None
+if 'optimization_running' not in st.session_state:
+    st.session_state.optimization_running = False
 
 # ============================================================================
-# AI ASSISTANT LOGIC (Robust Auto-Detect)
-# ============================================================================
-class GeminiAssistant:
-    def __init__(self, api_key):
-        self.model = None
-        self.model_available = False
-        
-        if not api_key:
-            st.error("⚠️ AI ERROR: Invalid API Key.")
-            return
-
-        try:
-            genai.configure(api_key=api_key)
-            # Auto-detect best available model
-            all_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-            available_names = [m.replace("models/", "") for m in all_models]
-            
-            preferred_order = ["gemini-1.5-flash", "gemini-flash-latest", "gemini-1.5-pro", "gemini-pro"]
-            target_model = next((m for m in preferred_order if m in available_names), available_names[0] if available_names else None)
-            
-            if target_model:
-                self.model = genai.GenerativeModel(target_model)
-                self.model_available = True
-            else:
-                st.error("❌ No text generation models found for this API key.")
-                self.model_available = False
-            
-        except Exception as e:
-            st.error(f"❌ AI Config Error: {e}")
-            self.model_available = False
-
-    def generate_response(self, user_message, context_str):
-        if not self.model_available: return "AI is not available."
-        
-        prompt = (
-            "You are an expert chemical reaction engineering assistant.\n"
-            f"Simulation context: {context_str}\n\n"
-            f"User request: {user_message}"
-        )
-        try:
-            return self.model.generate_content(prompt).text
-        except Exception as e:
-            if "429" in str(e): return "⚠️ Quota Limit Exceeded. Please wait 30 seconds."
-            return f"Error: {e}"
-
-# ============================================================================
-# REACTOR LOGIC
-# ============================================================================
-@dataclass
-class ReactorConfig:
-    diameter: float; bed_height: float; particle_diameter: float; catalyst_density: float
-    particle_porosity: float; tortuosity: float; bed_porosity: float; catalyst_mass: float
-    inlet_temperature: float; inlet_pressure: float; flow_rate: float
-    y_CH4_in: float; y_H2_in: float; y_N2_in: float
-    pre_exponential: float; activation_energy: float; beta: float; heat_of_reaction: float
-    
-    @property
-    def cross_section_area(self) -> float:
-        return np.pi * (self.diameter / 2) ** 2
-
-class MethaneDecompositionReactor:
-    def __init__(self, config: ReactorConfig, isothermal: bool = True):
-        self.cfg = config
-        self.isothermal = isothermal
-        
-        C_total_in = config.inlet_pressure / (R_GAS * config.inlet_temperature) / 1000
-        self.F_total_in = config.flow_rate * C_total_in
-        self.F_CH4_in = config.y_CH4_in * self.F_total_in
-        self.F_H2_in = config.y_H2_in * self.F_total_in
-        self.F_N2_in = config.y_N2_in * self.F_total_in
-    
-    def _ode_system(self, z, y):
-        F_CH4, F_H2, T, P = y
-        cfg = self.cfg
-        
-        # Stability Clamps
-        F_CH4 = max(F_CH4, 1e-30); F_H2 = max(F_H2, 0.0); T = max(T, 300.0); P = max(P, 1000.0)
-        
-        F_total = F_CH4 + F_H2 + self.F_N2_in
-        y_CH4 = F_CH4 / F_total; y_H2 = F_H2 / F_total; y_N2 = self.F_N2_in / F_total
-        
-        rho = gas_density(T, P, y_CH4, y_H2, y_N2)
-        mu = gas_viscosity(T, y_CH4, y_H2, y_N2)
-        
-        Q = F_total * 1000 * R_GAS * T / P
-        u = Q / cfg.cross_section_area
-        
-        C_CH4 = F_CH4 / Q
-        D_mol = diffusivity_CH4(T, P)
-        D_eff = D_mol * cfg.particle_porosity / cfg.tortuosity
-        k = arrhenius_rate_constant(T, cfg.pre_exponential, cfg.activation_energy, cfg.beta)
-        
-        phi = (cfg.particle_diameter / 6) * np.sqrt(k / D_eff) if D_eff > 0 else 0
-        eta = effectiveness_factor(phi)
-        r_bed = k * eta * C_CH4 * (1 - cfg.bed_porosity)
-        
-        A = cfg.cross_section_area
-        dF_CH4_dz = -1.0 * r_bed * A
-        dF_H2_dz = +2.0 * r_bed * A
-        
-        if self.isothermal:
-            dT_dz = 0.0
-        else:
-            Cp_mix = heat_capacity_mix(T, y_CH4, y_H2, y_N2)
-            F_total_mol = F_total * 1000
-            Q_rxn = -cfg.heat_of_reaction * r_bed * A * 1000
-            dT_dz = Q_rxn / (F_total_mol * Cp_mix + 1e-10)
-            
-        dP_dz = -ergun_pressure_drop(u, rho, mu, cfg.particle_diameter, cfg.bed_porosity)
-        return np.array([dF_CH4_dz, dF_H2_dz, dT_dz, dP_dz])
-        
-    def solve(self, n_points=200):
-        y0 = np.array([self.F_CH4_in, self.F_H2_in, self.cfg.inlet_temperature, self.cfg.inlet_pressure])
-        solution = solve_ivp(
-            self._ode_system, (0, self.cfg.bed_height), y0, 
-            method='RK45', t_eval=np.linspace(0, self.cfg.bed_height, n_points),
-            rtol=1e-8, atol=1e-12
-        )
-        z = solution.t
-        F_CH4 = np.maximum(solution.y[0], 0)
-        F_H2 = np.maximum(solution.y[1], 0)
-        T = solution.y[2]
-        P = solution.y[3]
-        F_total = F_CH4 + F_H2 + self.F_N2_in
-        
-        return {
-            'z': z, 'F_CH4': F_CH4, 'F_H2': F_H2, 'T': T, 'P': P,
-            'y_CH4': F_CH4/F_total, 'y_H2': F_H2/F_total, 'y_N2': self.F_N2_in/F_total,
-            'X_CH4': np.clip((self.F_CH4_in - F_CH4) / self.F_CH4_in, 0, 1),
-            'm_dot_C_kg_s': (self.F_CH4_in - F_CH4) * MW_C * 1000,
-            'm_dot_H2_kg_s': F_H2 * MW_H2 * 1000,
-            'V_dot_H2_Nm3_h': F_H2 * 1000 * R_GAS * 273.15 / 101325 * 3600
-        }
-
-# ============================================================================
-# MAIN APP & CALLBACKS
+# CORE FUNCTIONS
 # ============================================================================
 
-# --- Initialize State ---
-if 'simulation_data' not in st.session_state: st.session_state.simulation_data = None
-if 'chat_history' not in st.session_state: st.session_state.chat_history = []
-if 'config_data' not in st.session_state: st.session_state.config_data = None
-
-# --- CORE SIMULATION FUNCTION (Called by Button) ---
 def run_simulation():
-    """Reads current sidebar state and runs simulation immediately"""
+    """Run single simulation with current parameters"""
     try:
-        # 1. Gather inputs directly from session state
         total_y = st.session_state.y_ch4 + st.session_state.y_h2 + st.session_state.y_n2
-        if total_y == 0: total_y = 1.0
+        if total_y == 0:
+            total_y = 1.0
         
-        # 2. Build Config
         config = ReactorConfig(
-            diameter=st.session_state.d_reac/100, 
-            bed_height=st.session_state.h_bed/100, 
-            particle_diameter=st.session_state.d_part*1e-6,
-            catalyst_density=st.session_state.rho_cat, 
-            particle_porosity=st.session_state.eps_part, 
+            diameter=st.session_state.d_reac / 100,
+            bed_height=st.session_state.h_bed / 100,
+            particle_diameter=st.session_state.d_part * 1e-6,
+            catalyst_density=st.session_state.rho_cat,
+            particle_porosity=st.session_state.eps_part,
             tortuosity=st.session_state.tau,
-            bed_porosity=st.session_state.eps_bed, 
-            catalyst_mass=st.session_state.mass_cat/1000,
-            inlet_temperature=st.session_state.t_in+273.15, 
-            inlet_pressure=st.session_state.p_in*1e5, 
-            flow_rate=st.session_state.flow/60/1e6,
-            y_CH4_in=st.session_state.y_ch4/total_y, 
-            y_H2_in=st.session_state.y_h2/total_y, 
-            y_N2_in=st.session_state.y_n2/total_y,
-            pre_exponential=st.session_state.pre_exp, 
-            activation_energy=st.session_state.act_e*1000, 
+            bed_porosity=st.session_state.eps_bed,
+            catalyst_mass=st.session_state.mass_cat / 1000,
+            inlet_temperature=st.session_state.t_in + 273.15,
+            inlet_pressure=st.session_state.p_in * 1e5,
+            flow_rate=st.session_state.flow / 60 / 1e6,
+            y_CH4_in=st.session_state.y_ch4 / total_y,
+            y_H2_in=st.session_state.y_h2 / total_y,
+            y_N2_in=st.session_state.y_n2 / total_y,
+            pre_exponential=st.session_state.pre_exp,
+            activation_energy=st.session_state.act_e * 1000,
             beta=st.session_state.beta,
-            heat_of_reaction=st.session_state.dh*1e6
+            heat_of_reaction=st.session_state.dh * 1e6
         )
         
-        # 3. Solve
         reactor = MethaneDecompositionReactor(config, isothermal=st.session_state.iso_check)
         st.session_state.simulation_data = reactor.solve()
         st.session_state.config_data = config
@@ -245,8 +101,9 @@ def run_simulation():
     except Exception as e:
         st.error(f"Simulation Failed: {e}")
 
-# --- AI Helper ---
+
 def handle_ai_request(prompt_text):
+    """Handle AI chat request"""
     st.session_state.chat_history.append({"role": "user", "content": prompt_text})
     
     context_str = "No simulation run yet."
@@ -254,21 +111,39 @@ def handle_ai_request(prompt_text):
         r = st.session_state.simulation_data
         cfg = st.session_state.config_data
         context_str = (
-            f"Inlet: T={cfg.inlet_temperature-273.15:.0f}C, P={cfg.inlet_pressure/1e5:.1f}bar. "
+            f"Inlet: T={cfg.inlet_temperature-273.15:.0f}°C, P={cfg.inlet_pressure/1e5:.1f}bar. "
             f"Results: Conversion={r['X_CH4'][-1]*100:.2f}%, "
-            f"H2 Yield={r['V_dot_H2_Nm3_h'][-1]:.4f} Nm3/h."
+            f"H2 Yield={r['V_dot_H2_Nm3_h'][-1]:.4f} Nm³/h."
         )
+    
+    if st.session_state.optimization_result:
+        opt = st.session_state.optimization_result
+        context_str += f" Optimization: Best={opt.best_value:.4f}, Trials={len(opt.all_trials)}."
 
-    ai = GeminiAssistant(GEMINI_API_KEY)
-    response = ai.generate_response(prompt_text, context_str)
+    if GEMINI_API_KEY:
+        ai = GeminiAssistant(GEMINI_API_KEY)
+        response = ai.generate_response(prompt_text, context_str)
+    else:
+        response = "⚠️ AI not configured. Add GEMINI_API_KEY to secrets."
+    
     st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-# --- HEADER ---
-st.image("https://raw.githubusercontent.com/anukaranAI/methane-reactor/main/AnukaranNew7.png", width=500)
-st.markdown("### Methane Decomposition Reactor Simulator | Full Physics Engine")
+
+# ============================================================================
+# HEADER
+# ============================================================================
+col_logo, col_title = st.columns([1, 4])
+with col_logo:
+    st.image("https://raw.githubusercontent.com/anukaranAI/methane-reactor/main/AnukaranNew7.png", width=150)
+with col_title:
+    st.title("Methane Decomposition Reactor Simulator")
+    st.caption("AI-Powered Simulation & Optimization | CH₄ → C + 2H₂")
+
 st.markdown("---")
 
-# --- SIDEBAR (With Keys) ---
+# ============================================================================
+# SIDEBAR
+# ============================================================================
 with st.sidebar:
     st.header("⚙️ Input Parameters")
     
@@ -302,78 +177,304 @@ with st.sidebar:
     
     st.markdown("#### 🔧 Options")
     st.checkbox("Isothermal Simulation", value=True, key="iso_check")
-
-    # THE FIX: USING ON_CLICK CALLBACK
+    
     st.button("▶️ Run Simulation", type="primary", use_container_width=True, on_click=run_simulation)
 
-# --- MAIN RESULTS ---
-col_results, col_chat = st.columns([1.8, 1.2])
+# ============================================================================
+# MAIN CONTENT - TABS
+# ============================================================================
+tab_sim, tab_opt, tab_chat = st.tabs(["📊 Simulation Results", "🎯 Optimizer", "🤖 AI Assistant"])
 
-with col_results:
-    st.subheader("📊 Simulation Results")
-    
+# ============================================================================
+# TAB 1: SIMULATION RESULTS
+# ============================================================================
+with tab_sim:
     if st.session_state.simulation_data:
         r = st.session_state.simulation_data
         cfg = st.session_state.config_data
         
-        # Summary
-        m1, m2, m3 = st.columns(3)
+        # Metrics
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Conversion", f"{r['X_CH4'][-1]*100:.2f} %")
-        m2.metric("H2 Generation", f"{r['V_dot_H2_Nm3_h'][-1]:.4f} Nm³/h")
-        m3.metric("H2 Mass", f"{r['m_dot_H2_kg_s'][-1]*3600:.4f} kg/h")
+        m2.metric("H₂ Generation", f"{r['V_dot_H2_Nm3_h'][-1]:.4f} Nm³/h")
+        m3.metric("H₂ Mass Flow", f"{r['m_dot_H2_kg_s'][-1]*3600:.4f} kg/h")
+        m4.metric("Pressure Drop", f"{(cfg.inlet_pressure - r['P'][-1])/1000:.2f} kPa")
         
-        # Tabs
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Conversion", "Flow", "Composition", "Temp", "Pressure", "Yield"])
-        
+        # Plots
+        plot_tabs = st.tabs(["Conversion", "Flow Rates", "Composition", "Temperature", "Pressure", "H₂ Yield"])
         z_cm = r['z'] * 100
         
-        def plot_graph(x, y, ylabel, title, color):
-            fig, ax = plt.subplots(figsize=(6, 3.5))
-            ax.plot(x, y, color=color, lw=2)
-            ax.set_xlabel("Axial Position [cm]"); ax.set_ylabel(ylabel)
-            ax.grid(True, alpha=0.3); ax.set_title(title)
+        with plot_tabs[0]:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(z_cm, r['X_CH4']*100, 'b-', lw=2)
+            ax.set_xlabel("Axial Position [cm]")
+            ax.set_ylabel("CH₄ Conversion [%]")
+            ax.set_title("Conversion Profile")
+            ax.grid(True, alpha=0.3)
             st.pyplot(fig)
-            plt.close(fig) # CLEANUP MEMORY
-
-        with tab1: plot_graph(z_cm, r['X_CH4']*100, "CH4 Conversion [%]", "Conversion Profile", "blue")
-        with tab2:
-            fig, ax = plt.subplots(figsize=(6, 3.5))
-            ax.plot(z_cm, r['F_CH4']*1000, 'r-', label='CH4')
-            ax.plot(z_cm, r['F_H2']*1000, 'g-', label='H2')
-            ax.set_ylabel("Flow [mmol/s]"); ax.legend(); ax.grid(True, alpha=0.3)
-            st.pyplot(fig); plt.close(fig)
-        with tab3:
-            fig, ax = plt.subplots(figsize=(6, 3.5))
-            ax.plot(z_cm, r['y_CH4'], 'r-', label='CH4')
-            ax.plot(z_cm, r['y_H2'], 'g-', label='H2')
-            ax.plot(z_cm, r['y_N2'], 'b--', label='N2')
-            ax.set_ylabel("Mole Fraction"); ax.legend(); ax.grid(True, alpha=0.3)
-            st.pyplot(fig); plt.close(fig)
-        with tab4: plot_graph(z_cm, r['T']-273.15, "Temp [C]", "Temperature Profile", "orange")
-        with tab5: plot_graph(z_cm, r['P']/1e5, "Pressure [bar]", "Pressure Profile", "purple")
-        with tab6: plot_graph(z_cm, r['V_dot_H2_Nm3_h'], "H2 [Nm3/h]", "Cumulative Production", "green")
+            plt.close(fig)
+        
+        with plot_tabs[1]:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(z_cm, r['F_CH4']*1000, 'r-', lw=2, label='CH₄')
+            ax.plot(z_cm, r['F_H2']*1000, 'g-', lw=2, label='H₂')
+            ax.set_xlabel("Axial Position [cm]")
+            ax.set_ylabel("Molar Flow [mmol/s]")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+            plt.close(fig)
+        
+        with plot_tabs[2]:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(z_cm, r['y_CH4']*100, 'r-', lw=2, label='CH₄')
+            ax.plot(z_cm, r['y_H2']*100, 'g-', lw=2, label='H₂')
+            ax.plot(z_cm, r['y_N2']*100, 'b--', lw=2, label='N₂')
+            ax.set_xlabel("Axial Position [cm]")
+            ax.set_ylabel("Mole Fraction [%]")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+            plt.close(fig)
+        
+        with plot_tabs[3]:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(z_cm, r['T']-273.15, 'orange', lw=2)
+            ax.set_xlabel("Axial Position [cm]")
+            ax.set_ylabel("Temperature [°C]")
+            ax.set_title("Temperature Profile")
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+            plt.close(fig)
+        
+        with plot_tabs[4]:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(z_cm, r['P']/1e5, 'purple', lw=2)
+            ax.set_xlabel("Axial Position [cm]")
+            ax.set_ylabel("Pressure [bar]")
+            ax.set_title("Pressure Profile")
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+            plt.close(fig)
+        
+        with plot_tabs[5]:
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.plot(z_cm, r['V_dot_H2_Nm3_h'], 'green', lw=2)
+            ax.set_xlabel("Axial Position [cm]")
+            ax.set_ylabel("H₂ Production [Nm³/h]")
+            ax.set_title("Cumulative H₂ Production")
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
+            plt.close(fig)
         
         # Download
-        df = pd.DataFrame({'z': z_cm, 'X': r['X_CH4'], 'T': r['T']-273.15})
-        st.download_button("💾 Download CSV", df.to_csv(index=False), "results.csv", "text/csv")
-        
+        df = pd.DataFrame({
+            'z_cm': z_cm,
+            'Conversion_%': r['X_CH4']*100,
+            'T_C': r['T']-273.15,
+            'P_bar': r['P']/1e5,
+            'H2_Nm3h': r['V_dot_H2_Nm3_h']
+        })
+        st.download_button("💾 Download Results CSV", df.to_csv(index=False), "simulation_results.csv", "text/csv")
     else:
-        st.info("👈 Configure parameters and click Run to start.")
+        st.info("👈 Configure parameters in sidebar and click **Run Simulation**")
 
-# --- CHAT ---
-with col_chat:
-    st.subheader("🤖 AI Assistant")
-    with st.container():
-        c1, c2, c3 = st.columns(3)
-        if c1.button("📊 Analyze", use_container_width=True): handle_ai_request("Analyze the results.")
-        if c2.button("🔧 Optimize", use_container_width=True): handle_ai_request("How to optimize H2 yield?")
-        if c3.button("📚 Explain", use_container_width=True): handle_ai_request("Explain the physics.")
-            
-    st.markdown("---")
-    chat_box = st.container(height=500)
-    for msg in st.session_state.chat_history:
-        chat_box.chat_message(msg["role"]).write(msg["content"])
+# ============================================================================
+# TAB 2: OPTIMIZER
+# ============================================================================
+with tab_opt:
+    st.subheader("🎯 Bayesian Optimization")
+    st.markdown("Find optimal operating conditions using AI-powered search.")
+    
+    # Template Selection
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.markdown("#### Select Optimization Goal")
+        template_names = get_template_names()
+        selected_template_key = st.selectbox(
+            "Choose a preset:",
+            options=list(template_names.keys()),
+            format_func=lambda x: template_names[x],
+            key="opt_template"
+        )
         
-    if prompt := st.chat_input("Ask a question..."):
+        template = get_template(selected_template_key)
+        
+        st.info(f"**{template['description']}**\n\n*Use case: {template['use_case']}*")
+        
+        # Iterations
+        n_iterations = st.slider("Number of Iterations", 10, 100, template['suggested_iterations'], key="opt_iterations")
+    
+    with col2:
+        st.markdown("#### Variable Bounds")
+        st.caption("Adjust the search range for each parameter:")
+        
+        variable_bounds = {}
+        for var in template['variables']:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                min_val = st.number_input(
+                    f"{var['label']} Min ({var['unit']})",
+                    value=float(var['min']),
+                    key=f"opt_min_{var['key']}"
+                )
+            with col_b:
+                max_val = st.number_input(
+                    f"{var['label']} Max ({var['unit']})",
+                    value=float(var['max']),
+                    key=f"opt_max_{var['key']}"
+                )
+            variable_bounds[var['key']] = (min_val, max_val)
+    
+    st.markdown("---")
+    
+    # Run Optimization Button
+    if st.button("🚀 Start Optimization", type="primary", use_container_width=True):
+        
+        # Get base config from sidebar
+        base_config = get_base_config_from_session(st.session_state)
+        
+        # Setup optimizer
+        variable_names = list(variable_bounds.keys())
+        bounds = list(variable_bounds.values())
+        
+        config = OptimizationConfig(
+            variable_names=variable_names,
+            bounds=bounds,
+            n_iterations=n_iterations,
+            n_initial_points=min(5, n_iterations // 3),
+            maximize=(template['objective']['direction'] == 'maximize')
+        )
+        
+        # Create objective function
+        objective_fn = create_objective_function(
+            MethaneDecompositionReactor,
+            base_config,
+            variable_names,
+            template['objective']['target']
+        )
+        
+        # Progress display
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        trials_container = st.empty()
+        
+        trials_display = []
+        
+        def update_callback(iteration, params, value):
+            progress = iteration / n_iterations
+            progress_bar.progress(progress)
+            status_text.write(f"🔄 Iteration {iteration}/{n_iterations} | Current: {value:.4f}")
+            
+            trials_display.append({
+                'Iter': iteration,
+                **{k: f"{v:.2f}" for k, v in params.items()},
+                'Objective': f"{value:.4f}"
+            })
+            
+            if len(trials_display) > 0:
+                trials_container.dataframe(
+                    pd.DataFrame(trials_display[-10:]),  # Show last 10
+                    use_container_width=True
+                )
+        
+        # Run optimization
+        optimizer = BayesianOptimizer(config)
+        
+        with st.spinner("Running Bayesian Optimization..."):
+            result = optimizer.optimize(objective_fn, callback=update_callback)
+        
+        st.session_state.optimization_result = result
+        
+        progress_bar.progress(1.0)
+        status_text.write("✅ Optimization Complete!")
+        
+        st.success(f"**Best Value: {result.best_value:.4f}** found at iteration {len(result.all_trials)}")
+    
+    # Show results if available
+    if st.session_state.optimization_result:
+        result = st.session_state.optimization_result
+        
+        st.markdown("---")
+        st.markdown("### 🏆 Optimization Results")
+        
+        # Best parameters
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("#### Best Parameters Found")
+            for param, value in result.best_params.items():
+                st.metric(param, f"{value:.2f}")
+        
+        with col2:
+            st.markdown("#### Convergence Plot")
+            fig = create_convergence_plot(result.convergence, result.best_so_far)
+            st.pyplot(fig)
+            plt.close(fig)
+        
+        # Summary stats
+        stats = create_summary_stats(result.all_trials)
+        st.markdown("#### Summary Statistics")
+        stat_cols = st.columns(4)
+        stat_cols[0].metric("Total Trials", stats['total_trials'])
+        stat_cols[1].metric("Best Value", f"{stats['best_value']:.4f}")
+        stat_cols[2].metric("Mean Value", f"{stats['mean_value']:.4f}")
+        stat_cols[3].metric("Improvement", f"{stats['improvement']:.1f}%")
+        
+        # All trials table
+        with st.expander("📋 View All Trials"):
+            table_data = create_trials_table_data(result.all_trials, result.variable_names)
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True)
+        
+        # Download
+        trials_df = pd.DataFrame([
+            {**t['params'], 'objective': t['value']} 
+            for t in result.all_trials
+        ])
+        st.download_button(
+            "💾 Download Optimization Results",
+            trials_df.to_csv(index=False),
+            "optimization_results.csv",
+            "text/csv"
+        )
+
+# ============================================================================
+# TAB 3: AI ASSISTANT
+# ============================================================================
+with tab_chat:
+    st.subheader("🤖 AI Assistant")
+    
+    # Quick buttons
+    col1, col2, col3, col4 = st.columns(4)
+    if col1.button("📊 Analyze Results", use_container_width=True):
+        handle_ai_request("Analyze the current simulation results and provide insights.")
+    if col2.button("🔧 Optimization Tips", use_container_width=True):
+        handle_ai_request("How can I optimize H2 yield based on current parameters?")
+    if col3.button("📚 Explain Physics", use_container_width=True):
+        handle_ai_request("Explain the methane decomposition reaction kinetics.")
+    if col4.button("🗑️ Clear Chat", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Chat display
+    chat_container = st.container(height=400)
+    for msg in st.session_state.chat_history:
+        with chat_container:
+            if msg["role"] == "user":
+                st.chat_message("user").write(msg["content"])
+            else:
+                st.chat_message("assistant").write(msg["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask a question about the simulation..."):
         handle_ai_request(prompt)
         st.rerun()
+
+# ============================================================================
+# FOOTER
+# ============================================================================
+st.markdown("---")
+st.caption("Anukaran AI © 2024 | Methane Decomposition Reactor Simulator | Powered by Gemini AI")
